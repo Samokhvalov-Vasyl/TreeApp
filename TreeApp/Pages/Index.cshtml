@@ -1,0 +1,297 @@
+﻿@page
+@{
+    Layout = null;
+}
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Tree</title>
+</head>
+<body>
+    <button id="apply">Apply</button>
+    <button id="reset">Reset</button>
+    <div id="msg"></div>
+
+    <h3>Ground Level</h3>
+    <div id="db"></div>
+
+    <h3>Cached Tree View</h3>
+    <div id="cache"></div>
+
+    <script>
+            const ROOT = 'root';
+            const cache = new Map();
+            const dbChildren = new Map();
+            const dbOpen = new Set();
+            let seq = 0;
+
+            const $ = id => document.getElementById(id);
+
+            async function call(url, method, body) {
+              const r = await fetch(
+                  url, 
+                  { method, headers: { 'Content-Type': 'application/json' }, body: body && JSON.stringify(body) }
+              );
+              if (!r.ok) {
+                let m = r.status + ' ' + r.statusText;
+                try { 
+                    m = (await r.json()).error || m; 
+                } 
+                catch { }
+                throw new Error(m);
+              }
+              return r.status === 204 ? null : r.json();
+            }
+
+            async function run(fn) {
+              try { 
+                  $('msg').textContent = ''; 
+                  await fn(); 
+              }
+              catch (e) { 
+                  $('msg').textContent = e.message; 
+              }
+            }
+
+            function btn(text, fn) {
+              const b = document.createElement('button');
+              b.textContent = text;
+              b.onclick = () => run(fn);
+              return b;
+            }
+
+            function line(text, ...buttons) {
+              const d = document.createElement('div');
+              d.append(text + ' ');
+              buttons.forEach(b => d.append(b, ' '));
+              return d;
+            }
+
+            function indent(child) {
+              const d = document.createElement('div');
+              d.style.marginLeft = '20px';
+              d.append(child);
+              return d;
+            }
+
+            const order = n => n.id > 0 ? n.id : 1e9 - n.id;
+            const children = id => 
+                [...cache.values()]
+                .filter(n => n.parentId === id).sort((a, b) => order(a) - order(b));
+
+            function isDeleted(n) {
+              for (let c = n; c; c = cache.get(c.parentId)) {
+                  if (c.state === 'deleted') {
+                      return true;
+                  }
+              }
+              return false;
+            }
+
+            function descendants(id) {
+              return children(id).flatMap(k => [k, ...descendants(k.id)]);
+            }
+
+            function changes() {
+              const deletes = [], updates = [], adds = [];
+              for (const n of cache.values()) {
+                if (n.state === 'deleted') {
+                  const p = cache.get(n.parentId);
+                  if (!p || !isDeleted(p)) deletes.push(n.id);
+                } else if (isDeleted(n)) {
+                      continue;
+                } else if (n.state === 'modified') {
+                    updates.push({ id: n.id, value: n.value });
+                } else if (n.state === 'new') {
+                    adds.push({ tempId: n.id, parentId: n.parentId, value: n.value });
+                }
+              }
+              adds.sort((a, b) => b.tempId - a.tempId);
+              return { updates, adds, deletes };
+            }
+
+            function render() {
+              const db = $('db');
+              db.replaceChildren();
+              if (dbChildren.has(ROOT)) db.append(dbList(ROOT));
+
+              const roots = [...cache.values()]
+                .filter(n => n.parentId == null || !cache.has(n.parentId))
+                .sort((a, b) => order(a) - order(b));
+              const c = $('cache');
+              c.replaceChildren();
+              roots.forEach(n => c.append(cacheNode(n)));
+            }
+
+            function dbList(key) {
+              const box = document.createElement('div');
+              for (const n of dbChildren.get(key)) {
+                const open = dbOpen.has(n.id);
+                const parts = [];
+                if (n.hasChildren) {
+                    parts.push(btn(open ? '-' : '+', () => toggle(n.id)));
+                }
+                if (!cache.has(n.id)) {
+                    parts.push(btn('Load', () => load(n.id)));
+                }
+                box.append(line(n.value, ...parts));
+                if (open && dbChildren.has(n.id)) {
+                    box.append(indent(dbList(n.id)));
+                }
+              }
+              return box;
+            }
+
+            function cacheNode(n) {
+              const box = document.createElement('div');
+              if (isDeleted(n)) {
+                box.append(line(n.value + ' [deleted]'));
+              } else {
+                const tag = n.state === 'modified' 
+                    ? ' [modified]' 
+                    : n.state === 'new' ? ' [new]' : '';
+                const parts = [
+                  btn('Edit', () => edit(n)),
+                  btn('Add child', () => add(n)),
+                  btn('Delete', () => del(n))
+                ];
+                if (n.state !== 'new') {
+                    parts.push(btn('Load children', () => loadChildren(n)));
+                }
+                box.append(line(n.value + tag, ...parts));
+              }
+              children(n.id).forEach(k => box.append(indent(cacheNode(k))));
+              return box;
+            }
+
+            async function fetchChildren(key) {
+              if (!dbChildren.has(key)) {
+                  dbChildren.set(
+                      key,
+                      await call(
+                          key === ROOT ? '/api/nodes' : '/api/nodes?parentId=' + key, 'GET')
+                  );
+              }
+            }
+
+            async function toggle(id) {
+              if (dbOpen.has(id)) {
+                  dbOpen.delete(id);
+              }
+              else { 
+                  await fetchChildren(id); dbOpen.add(id);
+              }
+              render();
+            }
+
+            async function refreshDb() {
+              const open = [...dbOpen];
+              dbChildren.clear();
+              dbOpen.clear();
+              await fetchChildren(ROOT);
+              for (const id of open) {
+                if (![...dbChildren.values()].some(l => l.some(n => n.id === id))) {
+                    continue;
+                }
+                await fetchChildren(id);
+                dbOpen.add(id);
+              }
+            }
+
+            async function load(id) {
+              const n = await call('/api/nodes/' + id, 'GET');
+              if (!cache.has(n.id)) {
+                  cache.set(
+                      n.id, 
+                      { id: n.id, parentId: n.parentId, value: n.value, orig: n.value, state: 'clean' }
+                  );
+              }
+              render();
+            }
+
+            function edit(n) {
+              const v = (prompt('New value:', n.value) || '').trim();
+              if (!v) {
+                  return;
+              }
+              n.value = v;
+              if (n.state !== 'new') {
+                  n.state = v === n.orig ? 'clean' : 'modified';
+              }
+              render();
+            }
+
+            function add(parent) {
+              const v = (prompt('Value of the new child:') || '').trim();
+              if (!v) {
+                  return;
+              }
+              const id = --seq;
+              cache.set(id, { id, parentId: parent.id, value: v, orig: v, state: 'new' });
+              render();
+            }
+
+            function del(n) {
+              if (!confirm('Delete "' + n.value + '" and all its descendants?')) {
+                  return;
+              }
+              if (n.state === 'new') {
+                descendants(n.id).forEach(d => cache.delete(d.id));
+                cache.delete(n.id);
+              } else {
+                descendants(n.id).filter(d => d.state === 'new').forEach(d => cache.delete(d.id));
+                n.state = 'deleted';
+              }
+              render();
+            }
+
+            async function loadChildren(n) {
+              const list = await call('/api/nodes?parentId=' + n.id, 'GET');
+              for (const c of list)
+                if (!cache.has(c.id)) {
+                  cache.set(
+                      c.id, 
+                      { id: c.id, parentId: c.parentId, value: c.value, orig: c.value, state: 'clean' });
+                }
+              render();
+            }
+
+            async function apply() {
+              const ch = changes();
+              if (!ch.updates.length && !ch.adds.length && !ch.deletes.length) {
+                  return;
+              }
+              const { idMap } = await call('/api/apply', 'POST', ch);
+
+              const survivors = [...cache.values()].filter(n => !isDeleted(n));
+              cache.clear();
+              for (const n of survivors) {
+                const id = n.state === 'new' ? idMap[n.id] : n.id;
+                const parentId = n.parentId != null && n.parentId < 0 ? idMap[n.parentId] : n.parentId;
+                cache.set(id, { id, parentId, value: n.value, orig: n.value, state: 'clean' });
+              }
+              seq = 0;
+              await refreshDb();
+              render();
+            }
+
+            async function reset() {
+              if (!confirm('Reset the database and clear the cache?')) {
+                  return;
+              }
+              await call('/api/reset', 'POST');
+              cache.clear();
+              dbChildren.clear();
+              dbOpen.clear();
+              seq = 0;
+              await fetchChildren(ROOT);
+              render();
+            }
+
+            $('apply').onclick = () => run(apply);
+            $('reset').onclick = () => run(reset);
+            run(async () => { await fetchChildren(ROOT); render(); });
+    </script>
+</body>
+</html>
